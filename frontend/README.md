@@ -177,6 +177,111 @@ const storage = multer.diskStorage({
 export const upload = multer({ 
     storage, 
 })```
+backend\models\user.model.js--create a schema
+backend\controllers\user.controller.js
+in registerNewUserAccount function: 
+1. /register (registerNewUserAccount)=> asyncHandler(.js), sanitize body(npm i mongo-sanitize), validate using zod(registerUserSchema in auth.validation.js)  
+ApiError(name, email,.js)
+2. check existingUser
+3. GenerateUniqueUsername
+4. create user and send response of error(ApiError.js)
+
+``import { User } from "../models/user.model.js";
+import { asyncHandler } from "../utils/asyncHandler.js";
+import { ApiError } from "../utils/ApiError.js";
+import { ApiResponse } from "../utils/ApiResponse.js";
+import { registerUserSchema } from "../validations/auth.validation.js";
+import sanitize from "mongo-sanitize";
+
+/**
+ * @desc    Register a new user account
+ * @route   POST /api/v1/auth/register
+ * @access  Public
+ */
+
+export const registerNewUserAccount = asyncHandler(async (req, res) => {
+  // console.log("HEADERS:", req.headers);
+  // console.log("BODY:", req.body);
+  // 1️⃣ Sanitize Request Body (mutates req.body)
+  sanitize(req.body);
+  const { fullname } = req.body;
+
+  if (!fullname) {
+    throw new ApiError(400, "Full name is required");
+  }
+
+  // 2️⃣ Validate Only Email & Password Using Zod
+  const validationResult = registerUserSchema.safeParse(req.body);
+
+  if (!validationResult.success) {
+    const formattedErrors = validationResult.error.issues.map(
+      (err) => err.message
+    );
+
+    throw new ApiError(400, "Validation failed", formattedErrors);
+  }
+
+  const { email, password } = validationResult.data;
+
+  // 3️⃣ Check Existing Email
+  const existingUser = await User.findOne({ email });
+
+  if (existingUser) {
+    throw new ApiError(
+      409,
+      "An account with this email address already exists. Please log in instead."
+    );
+  }
+
+  // 4️⃣ Generate Unique Username
+  const baseUsername = fullname
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[^a-z0-9]/g, "");
+
+  let generatedUsername = baseUsername;
+  let counter = 1;
+
+  while (await User.findOne({ userName: generatedUsername })) {
+    generatedUsername = `${baseUsername}${counter++}`;
+  }
+
+  // 5️⃣ Create User
+  const newUser = await User.create({
+    fullname,
+    email,
+    password,
+    userName: generatedUsername,
+  });
+
+  // 6️⃣ Send Response
+  return res.status(201).json(
+    new ApiResponse(
+      201,
+      {
+        id: newUser._id,
+        fullname: newUser.fullname,
+        email: newUser.email,
+        userName: newUser.userName,
+      },
+      "Your account has been successfully created. You may now log in."
+    )
+  );
+});``
+
+D:\micro_13\backend\routes\auth.routes.js
+``import express from "express";
+import { registerNewUserAccount } from "../controllers/user.controller.js";
+import { upload } from "../middlewares/multer.middleware.js";
+const router = express.Router();
+router.post("/register", registerNewUserAccount);
+export default router;``'
+
+D:\micro_13\backend\app.js
+import authRoutes from "./routes/auth.routes.js";
+app.use("/api/v1/auth", authRoutes);
+
+
 
 #GOOGLE AUTH
 [text](https://github.com/raj21parihar/express-auth-starter-template)
