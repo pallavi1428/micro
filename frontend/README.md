@@ -178,13 +178,15 @@ export const upload = multer({
     storage, 
 })```
 backend\models\user.model.js--create a schema
-backend\controllers\user.controller.js
+
+### backend\controllers\user.controller.js
 in registerNewUserAccount function: 
 1. /register (registerNewUserAccount)=> asyncHandler(.js), sanitize body(npm i mongo-sanitize), validate using zod(registerUserSchema in auth.validation.js)  
 ApiError(name, email,.js)
 2. check existingUser
 3. GenerateUniqueUsername
 4. create user and send response of error(ApiError.js)
+5. add redis in index.js and backend\utils\redis.js
 
 ``import { User } from "../models/user.model.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
@@ -276,10 +278,72 @@ import { upload } from "../middlewares/multer.middleware.js";
 const router = express.Router();
 router.post("/register", registerNewUserAccount);
 export default router;``'
-
 D:\micro_13\backend\app.js
 import authRoutes from "./routes/auth.routes.js";
 app.use("/api/v1/auth", authRoutes);
+
+use redis to add ratelimit verification link;
+in index.js-- after connectDB
+
+const redisURL = PROCESS.env.REDIS_URL;
+if (!redisURL) {
+    console.log("missing redis url");
+    process.exit(1);
+}
+export const redisClient = createClient({
+    url: redisURL,
+});
+redisClient
+    .connect()
+    .then(() =>console.log("connected to redis"))
+    .catch(console.error);
+
+then in Usercontroller add redis
+
+const rateLimitKey = `register-rate-limit:${req.ip}:${email}`;
+if(await redisClient.get(rateLimitKey)){
+    return res.status(429).json({
+        message: "Too many requests, please try again later",
+    });
+}
+
+const existingUser = await User.findOne({email})
+if(existingUser) {
+    return res.status(400).json({
+        message: "User already exists",
+    });
+}
+hash password, verify token, datastore,
+const hashPassword = await brcypt.hash(password,10);
+const verifyToken = crypto.randomBytes(32).toString("hex);
+const verifyKey = ` verify:$(verifyToken)`;
+const datatoStore = JSON.stringify({
+    name,
+    email,
+    password: hashPassword,
+})
+
+awair rediscllient.set(verifyKey, datatoStore, { EX: 300});
+const subject = "verify your email for Account creation";
+const html = `` 
+await sendMail({email, subjhect, html});
+await redisClient.set(rateLimitKey, "true", {EX: 60});
+
+res.json({
+    message: "If your email is valid, a verification link has been sent. It will expire in 5 min"
+});
+});
+
+then create sendmail.html with getOtphtml(env = frontend url and app name)
+and /verify
+generate token access and refresh
+/me and /verifyotp
+cookie parser
+generate accesstoken with refresh token - 
+verifyrefreshtoken
+
+so in business logic;i i will compile all in auth.service.js ig
+1. redis 2. zod 3. generate access and refresh token validation 4. verifyotp 5. verifyrefresh token 6. 
 
 
 

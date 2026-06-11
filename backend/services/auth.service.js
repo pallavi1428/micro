@@ -1,499 +1,330 @@
-/* File: backend/services/auth.service.js */
-import jwt from "jsonwebtoken";
+import { User } from "../models/user.model.js";
+import { redisClient } from "../utils/redis.js";
+import { ApiError } from "../utils/ApiError.js";
+import { sendMail } from "../utils/sendMail.js";
+import { getVerifyEmailHtml } from "../utils/emailTemplates.js";
+import bcrypt from "bcryptjs";
 import crypto from "crypto";
-import { User, SecurityConfig } from "../models/user.model.js";
+import sanitize from "mongo-sanitize";
+import { registerUserSchema } from "../validations/auth.validation.js";
 
 class AuthService {
   constructor() {
-    this.accessSecret = process.env.ACCESS_TOKEN_SECRET;
-    this.refreshSecret = process.env.REFRESH_TOKEN_SECRET;
-    this.accessExpiry = process.env.ACCESS_TOKEN_EXPIRY || "15m";
-    this.refreshExpiry = process.env.REFRESH_TOKEN_EXPIRY || "7d";
-    
-    this.issuer = process.env.JWT_ISSUER || 'micro@lanceto@hobital';
-    this.audience = process.env.JWT_AUDIENCE || 'microlancer';
-    
-    // For Upwork-style platform: 30-45 days absolute expiry
-    this.absoluteExpiryDays = parseInt(process.env.ABSOLUTE_SESSION_EXPIRY_DAYS) || 30;
-    
-    // High-risk action threshold (5 minutes)
-    this.highRiskThreshold = 5 * 60 * 1000; // 5 minutes in milliseconds
-    
-    // Optional: Enable refresh token reuse detection
-    this.enableReuseDetection = process.env.ENABLE_REUSE_DETECTION === 'true' || false;
-  }
-
-  // ================= HELPER FUNCTIONS =================
-  hashToken(token) {
-    return crypto.createHash('sha256').update(token).digest('hex');
-  }
-
-  parseExpiryToMs(expiry) {
-    if (!expiry || typeof expiry !== 'string') return 7 * 24 * 60 * 60 * 1000;
-    
-    const unit = expiry.slice(-1);
-    const value = parseInt(expiry.slice(0, -1), 10);
-    
-    if (isNaN(value)) return 7 * 24 * 60 * 60 * 1000;
-
-    switch (unit) {
-      case 'd': return value * 24 * 60 * 60 * 1000;
-      case 'h': return value * 60 * 60 * 1000;
-      case 'm': return value * 60 * 1000;
-      case 's': return value * 1000;
-      default: return 7 * 24 * 60 * 60 * 1000;
-    }
-  }
-
-  generateCode() {
-    const code = crypto.randomInt(100000, 1000000).toString();
-    const hashedCode = this.hashToken(code);
-    return {
-      plainCode: code,
-      hashedCode,
-      expiresAt: Date.now() + SecurityConfig.VERIFICATION_CODE_EXPIRY,
+    this.config = {
+      RATE_LIMIT: {
+        REGISTER: 60, // 60 seconds
+        VERIFICATION_EXPIRY: 300, // 5 minutes
+      },
+      BCRYPT_ROUNDS: parseInt(process.env.BCRYPT_ROUNDS, 10) || 10,
     };
   }
 
-  verifyCode(plainCode, hashedCode, expiresAt) {
-    if (!hashedCode || !expiresAt) return false;
-    if (expiresAt < Date.now()) return false;
+  /**
+   * Complete user registration flow
+   * @param {Object} body - Request body
+   * @param {string} ip - Client IP address
+   * @returns {Promise<Object>} Registration result
+   */
+  async registerUser(body, ip) {
+    // 1️⃣ Sanitize input
+    const cleanBody = sanitize(body);
 
-    const hashedInput = this.hashToken(plainCode);
-
-    try {
-      return crypto.timingSafeEqual(
-        Buffer.from(hashedInput),
-        Buffer.from(hashedCode)
-      );
-    } catch {
-      return hashedInput === hashedCode;
+    // 2️⃣ Validate input
+    const validationResult = registerUserSchema.safeParse(cleanBody);
+    if (!validationResult.success) {
+      const formattedErrors = validationResult.error.issues.map(err => ({
+        field: err.path.join('.'),
+        message: err.message
+      }));
+      throw new ApiError(400, "Validation failed", formattedErrors);
     }
-  }
 
-  // ================= TOKEN GENERATION =================
-  generateTokens(user, deviceInfo = {}) {
-    const now = Date.now();
-    const refreshExpiryMs = this.parseExpiryToMs(this.refreshExpiry);
-    const absoluteExpiryMs = this.absoluteExpiryDays * 24 * 60 * 60 * 1000;
-    
-    // Session expiry is just refresh expiry (sliding window)
-    const sessionExpiryMs = refreshExpiryMs;
-    
-    const accessToken = jwt.sign(
-      {
-        id: user._id,
-        email: user.email,
-        userName: user.userName,
-        fullname: user.fullname,
-        type: 'access',
-      },
-      this.accessSecret,
-      {
-        expiresIn: this.accessExpiry,
-        issuer: this.issuer,
-        audience: this.audience,
-      }
-    );
+    const { fullname, email, password } = validationResult.data;
 
-    // Refresh token includes absolute expiry as a claim
-    const refreshToken = jwt.sign(
-      { 
-        id: user._id,
-        type: 'refresh',
-        absoluteExpiry: now + absoluteExpiryMs, // Hard absolute expiry
-      },
-      this.refreshSecret,
-      {
-        expiresIn: this.refreshExpiry,
-        issuer: this.issuer,
-        audience: this.audience,
-      }
-    );
+    // 3️⃣ Check rate limit
+    await this._checkRateLimit(ip, email);
 
-    return {
-      accessToken,
-      refreshToken,
-      hashedRefreshToken: this.hashToken(refreshToken),
-      expiresAt: new Date(now + sessionExpiryMs), // Sliding window expiry (e.g., 7 days)
-      absoluteExpiresAt: new Date(now + absoluteExpiryMs), // Hard stop (e.g., 30 days)
-      deviceInfo: deviceInfo.deviceName || 'Unknown device',
-      ipAddress: deviceInfo.ipAddress || '',
-      userAgent: deviceInfo.userAgent || '',
+    // 4️⃣ Check if user exists
+    await this._validateUserNotExists(email);
+
+    // 5️⃣ Hash password
+    const hashedPassword = await this._hashPassword(password);
+
+    // 6️⃣ Create verification session
+    const userData = { 
+      fullname: fullname.trim(), 
+      email: email.toLowerCase().trim(), 
+      password: hashedPassword,
+      ip 
     };
-  }
-
-  verifyAccessToken(token) {
-    try {
-      return jwt.verify(token, this.accessSecret, {
-        issuer: this.issuer,
-        audience: this.audience,
-      });
-    } catch {
-      return null;
-    }
-  }
-
-  verifyRefreshToken(token) {
-    try {
-      return jwt.verify(token, this.refreshSecret, {
-        issuer: this.issuer,
-        audience: this.audience,
-      });
-    } catch {
-      return null;
-    }
-  }
-
-  // ================= HIGH-RISK ACTION CHECK =================
-  // For Upwork-style: Require recent auth for sensitive actions
-  isRecentAuth(accessToken) {
-    try {
-      const decoded = jwt.verify(accessToken, this.accessSecret, {
-        issuer: this.issuer,
-        audience: this.audience,
-      });
-      
-      const tokenAge = Date.now() - (decoded.iat * 1000);
-      return tokenAge <= this.highRiskThreshold;
-    } catch {
-      return false;
-    }
-  }
-
-  // ================= AUTHENTICATION =================
-  async authenticate(identifier, password) {
-    const normalizedIdentifier = String(identifier || '').toLowerCase().trim();
     
-    if (!normalizedIdentifier || !password) {
-      return { user: null, error: 'Invalid credentials' };
-    }
+    const { verifyToken } = await this._createVerificationSession(userData);
 
-    const user = await User.findOne({
-      $or: [
-        { email: normalizedIdentifier },
-        { userName: normalizedIdentifier }
-      ]
-    }).select('+password +loginAttempts +lockUntil +accountVerified +isActive');
-
-    if (!user) return { user: null, error: 'Invalid credentials' };
-
-    if (!user.accountVerified) return { user: null, error: 'Please verify your email' };
-    if (!user.isActive) return { user: null, error: 'Account is deactivated' };
-    if (user.isLocked) {
-      const minutesLeft = Math.ceil((user.lockUntil - Date.now()) / 60000);
-      return { user: null, error: `Too many attempts. Try again in ${minutesLeft} minutes.` };
-    }
-
-    const isMatch = await user.comparePassword(password);
-    
-    if (!isMatch) {
-      user.loginAttempts += 1;
-      if (user.loginAttempts >= SecurityConfig.MAX_LOGIN_ATTEMPTS) {
-        user.lockUntil = Date.now() + SecurityConfig.LOCK_TIME;
-      }
-      await user.save({ validateBeforeSave: false });
-      return { user: null, error: 'Invalid credentials' };
-    }
-
-    user.loginAttempts = 0;
-    user.lockUntil = undefined;
-    await user.save({ validateBeforeSave: false });
-
-    return { user, error: null };
-  }
-
-  // ================= SESSION MANAGEMENT =================
-  async addSession(user, tokenData) {
-    if (!user.sessions) user.sessions = [];
-
-    // Clean expired sessions (both sliding and absolute)
-    user.sessions = user.sessions.filter(s => 
-      s.expiresAt > Date.now() && s.absoluteExpiresAt > Date.now()
-    );
-
-    // FIFO session rotation
-    if (user.sessions.length >= SecurityConfig.MAX_ACTIVE_SESSIONS) {
-      user.sessions.sort((a, b) => a.lastUsed - b.lastUsed);
-      user.sessions.shift();
-    }
-
-    user.sessions.push({
-      refreshToken: tokenData.hashedRefreshToken,
-      deviceInfo: tokenData.deviceInfo,
-      ipAddress: tokenData.ipAddress,
-      userAgent: tokenData.userAgent,
-      lastUsed: new Date(),
-      expiresAt: tokenData.expiresAt, // Sliding window expiry
-      absoluteExpiresAt: tokenData.absoluteExpiresAt, // Hard stop expiry
-      createdAt: new Date(),
+    // 7️⃣ Send verification email (fire and forget)
+    this._sendVerificationEmail(fullname, email, verifyToken).catch(err => {
+      console.error("Failed to send verification email:", err);
     });
 
-    user.refreshToken = tokenData.hashedRefreshToken;
-    await user.save({ validateBeforeSave: false });
+    // 8️⃣ Apply rate limit
+    await this._applyRateLimit(ip, email);
+
+    return {
+      success: true,
+      message: "If the email is valid, a verification link has been sent. It expires in 5 minutes."
+    };
   }
 
-  async findUserByRefreshToken(refreshToken) {
-    if (!refreshToken) return null;
-    
-    const hashedToken = this.hashToken(refreshToken);
-    
-    const user = await User.findOne({
-      $or: [
-        { 'sessions.refreshToken': hashedToken },
-        { refreshToken: hashedToken }
-      ]
-    }).select('+sessions +refreshToken +accountVerified +isActive +passwordChangedAt');
+  /**
+   * Complete user verification flow
+   * @param {string} token - Verification token
+   * @returns {Promise<Object>} Verified user data
+   */
+  async verifyUser(token) {
+    // 1️⃣ Validate token
+    if (!token) {
+      throw new ApiError(400, "Verification token is required.");
+    }
 
-    return user;
+    // 2️⃣ Get and validate verification data
+    const { verifyKey, userData } = await this._getVerificationData(token);
+
+    // 3️⃣ Create user in database
+    const newUser = await this._createUser(userData);
+
+    // 4️⃣ Clean up Redis key (fire and forget)
+    this._deleteVerificationKey(verifyKey).catch(console.error);
+
+    // 5️⃣ Return sanitized user
+    return this._sanitizeUser(newUser);
   }
 
-  // 🔴 FIX: Complete refreshTokens with type validation and optional reuse detection
-  async refreshTokens(refreshToken) {
-    if (!refreshToken) {
-      return { accessToken: null, error: 'Refresh token required' };
-    }
-
-    const decoded = this.verifyRefreshToken(refreshToken);
-    if (!decoded) return { accessToken: null, error: 'Invalid refresh token' };
-
-    // 🔴 NEW: Validate token type
-    if (decoded.type !== 'refresh') {
-      return { accessToken: null, error: 'Invalid token type' };
-    }
-
-    const user = await this.findUserByRefreshToken(refreshToken);
-    
-    // 🔴 OPTIONAL: Advanced reuse detection
-    if (!user && this.enableReuseDetection) {
-      // Token was valid but not found in DB - possible theft
-      // Find user by ID from decoded token and nuke all sessions
-      const possibleUser = await User.findById(decoded.id).select('+sessions +refreshToken');
-      if (possibleUser) {
-        console.warn(`⚠️ Possible refresh token reuse detected for user ${possibleUser._id}`);
-        possibleUser.sessions = [];
-        possibleUser.refreshToken = undefined;
-        await possibleUser.save({ validateBeforeSave: false });
+  /**
+   * Private: Check rate limit
+   */
+  async _checkRateLimit(ip, email) {
+    try {
+      const rateLimitKey = `register:rate-limit:${ip}:${email}`;
+      const isRateLimited = await redisClient.get(rateLimitKey);
+      
+      if (isRateLimited) {
+        const remainingTime = await redisClient.ttl(rateLimitKey);
+        throw new ApiError(
+          429,
+          `Too many registration attempts. Please wait ${remainingTime} seconds before trying again.`
+        );
       }
-      return { accessToken: null, error: 'Session expired' };
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      throw new ApiError(503, "Service temporarily unavailable. Please try again later.");
     }
+  }
 
-    if (!user) return { accessToken: null, error: 'Session expired' };
-
-    if (!user.accountVerified) return { accessToken: null, error: 'Account not verified' };
-    if (!user.isActive) return { accessToken: null, error: 'Account deactivated' };
-
-    const hashedToken = this.hashToken(refreshToken);
-    const session = user.sessions?.find(s => s.refreshToken === hashedToken);
-    
-    // Check 1: Token claim absolute expiry
-    if (decoded.absoluteExpiry && decoded.absoluteExpiry < Date.now()) {
-      if (session) {
-        user.sessions = user.sessions.filter(s => s.refreshToken !== hashedToken);
-        await user.save({ validateBeforeSave: false });
-      }
-      return { accessToken: null, error: 'Session expired (absolute limit reached)' };
-    }
-
-    // Check 2: DB absolute expiry (more trustworthy)
-    if (session && session.absoluteExpiresAt < Date.now()) {
-      user.sessions = user.sessions.filter(s => s.refreshToken !== hashedToken);
-      await user.save({ validateBeforeSave: false });
-      return { accessToken: null, error: 'Session expired (absolute limit reached)' };
-    }
-
-    // Check password changed after token issuance
-    if (user.passwordChangedAt) {
-      const tokenIssuedAt = decoded.iat * 1000;
-      if (user.passwordChangedAt > tokenIssuedAt) {
-        return { accessToken: null, error: 'Token invalidated by password change' };
-      }
-    }
-
-    // Generate new tokens with consistent type fields
-    const newAccessToken = jwt.sign(
-      { 
-        id: user._id, 
-        email: user.email, 
-        userName: user.userName, 
-        fullname: user.fullname,
-        type: 'access'
-      },
-      this.accessSecret,
-      {
-        expiresIn: this.accessExpiry,
-        issuer: this.issuer,
-        audience: this.audience,
-      }
-    );
-
-    const absoluteExpiry = session?.absoluteExpiresAt?.getTime() || 
-                          decoded.absoluteExpiry || 
-                          Date.now() + (this.absoluteExpiryDays * 24 * 60 * 60 * 1000);
-    
-    const newRefreshToken = jwt.sign(
-      { 
-        id: user._id,
-        type: 'refresh',
-        absoluteExpiry,
-      },
-      this.refreshSecret,
-      {
-        expiresIn: this.refreshExpiry,
-        issuer: this.issuer,
-        audience: this.audience,
-      }
-    );
-
-    const hashedNewRefresh = this.hashToken(newRefreshToken);
-    const expiryMs = this.parseExpiryToMs(this.refreshExpiry);
-
-    // Update session
-    if (session) {
-      const sessionIndex = user.sessions.findIndex(s => s.refreshToken === hashedToken);
-      if (sessionIndex > -1) {
-        user.sessions[sessionIndex].refreshToken = hashedNewRefresh;
-        user.sessions[sessionIndex].lastUsed = new Date();
-        user.sessions[sessionIndex].expiresAt = new Date(Date.now() + expiryMs);
-        // absoluteExpiresAt remains unchanged - hard stop doesn't extend
-      }
-    } else {
-      // Legacy session handling
-      if (!user.sessions) user.sessions = [];
-      user.sessions.push({
-        refreshToken: hashedNewRefresh,
-        deviceInfo: 'Legacy Device',
-        lastUsed: new Date(),
-        expiresAt: new Date(Date.now() + expiryMs),
-        absoluteExpiresAt: new Date(absoluteExpiry),
-        createdAt: new Date(),
+  /**
+   * Private: Apply rate limit
+   */
+  async _applyRateLimit(ip, email) {
+    try {
+      const rateLimitKey = `register:rate-limit:${ip}:${email}`;
+      await redisClient.set(rateLimitKey, "1", { 
+        EX: this.config.RATE_LIMIT.REGISTER 
       });
+    } catch (error) {
+      console.error("Failed to apply rate limit:", error);
+      // Non-critical error - don't throw
     }
+  }
 
-    user.refreshToken = hashedNewRefresh;
-    await user.save({ validateBeforeSave: false });
+  /**
+   * Private: Validate user doesn't exist
+   */
+  async _validateUserNotExists(email) {
+    try {
+      const existingUser = await User.findOne({ email }).select("_id");
+      if (existingUser) {
+        throw new ApiError(
+          409,
+          "An account with this email already exists. Please login or reset your password."
+        );
+      }
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      throw new ApiError(500, "Database error while checking user existence");
+    }
+  }
 
+  /**
+   * Private: Hash password
+   */
+  async _hashPassword(password) {
+    try {
+      return await bcrypt.hash(password, this.config.BCRYPT_ROUNDS);
+    } catch (error) {
+      throw new ApiError(500, "Error processing password. Please try again.");
+    }
+  }
+
+  /**
+   * Private: Create verification session
+   */
+  async _createVerificationSession(userData) {
+    try {
+      const verifyToken = crypto.randomBytes(32).toString("hex");
+      const verifyKey = `verify:session:${verifyToken}`;
+      
+      const dataToStore = {
+        ...userData,
+        createdAt: Date.now(),
+      };
+      
+      await redisClient.set(
+        verifyKey, 
+        JSON.stringify(dataToStore), 
+        { EX: this.config.RATE_LIMIT.VERIFICATION_EXPIRY }
+      );
+      
+      return { verifyToken, verifyKey };
+    } catch (error) {
+      throw new ApiError(503, "Failed to create verification session. Please try again.");
+    }
+  }
+
+  /**
+   * Private: Get verification data
+   */
+  async _getVerificationData(token) {
+    try {
+      const verifyKey = `verify:session:${token}`;
+      const userDataJson = await redisClient.get(verifyKey);
+      
+      if (!userDataJson) {
+        throw new ApiError(400, "The verification link is invalid or has expired. Please request a new one.");
+      }
+      
+      const userData = JSON.parse(userDataJson);
+      
+      // Validate data integrity
+      if (!userData.email || !userData.fullname || !userData.password) {
+        await redisClient.del(verifyKey);
+        throw new ApiError(400, "Invalid verification data. Please register again.");
+      }
+      
+      return { verifyKey, userData };
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      throw new ApiError(503, "Service temporarily unavailable. Please try again later.");
+    }
+  }
+
+  /**
+   * Private: Create user in database
+   */
+  async _createUser(userData) {
+    try {
+      const userName = await this._generateUniqueUsername(userData.fullname);
+      
+      const newUser = await User.create({
+        fullname: userData.fullname,
+        email: userData.email,
+        password: userData.password,
+        userName,
+        accountVerified: true,
+      });
+
+      if (!newUser) {
+        throw new Error("User creation failed");
+      }
+
+      return newUser;
+    } catch (error) {
+      if (error.code === 11000) {
+        const field = Object.keys(error.keyPattern)[0];
+        throw new ApiError(409, `${field} already exists. Please try again.`);
+      }
+      throw new ApiError(500, "Failed to create user account. Please try again.");
+    }
+  }
+
+  /**
+   * Private: Generate unique username
+   */
+  async _generateUniqueUsername(fullname) {
+    try {
+      const baseUsername = fullname
+        .toLowerCase()
+        .replace(/\s+/g, "")
+        .replace(/[^a-z0-9]/g, "")
+        .slice(0, 25);
+
+      if (!baseUsername || baseUsername.length < 3) {
+        const randomStr = crypto.randomBytes(4).toString("hex");
+        return `user${randomStr}`;
+      }
+
+      let username = baseUsername;
+      let counter = 1;
+      let maxAttempts = 100;
+
+      while (await User.findOne({ userName: username }).select("_id")) {
+        if (counter >= maxAttempts) {
+          const randomStr = crypto.randomBytes(4).toString("hex");
+          return `user${randomStr}`;
+        }
+        
+        const suffix = counter.toString();
+        const availableSpace = 30 - suffix.length;
+        username = baseUsername.slice(0, availableSpace) + suffix;
+        counter++;
+      }
+
+      return username;
+    } catch (error) {
+      // Fallback to random username
+      return `user${crypto.randomBytes(4).toString("hex")}`;
+    }
+  }
+
+  /**
+   * Private: Send verification email
+   */
+  async _sendVerificationEmail(fullname, email, token) {
+    const verificationLink = `${process.env.FRONTEND_URL}/verify-email/${token}`;
+    const subject = `Verify your email for ${process.env.APP_NAME || "Account Creation"}`;
+    const html = getVerifyEmailHtml({
+      fullname,
+      verificationLink,
+      appName: process.env.APP_NAME,
+    });
+
+    await sendMail({ email, subject, html });
+  }
+
+  /**
+   * Private: Delete verification key
+   */
+  async _deleteVerificationKey(verifyKey) {
+    try {
+      await redisClient.del(verifyKey);
+    } catch (error) {
+      console.error("Failed to delete verification key:", error);
+    }
+  }
+
+  /**
+   * Private: Sanitize user for response
+   */
+  _sanitizeUser(user) {
     return {
-      accessToken: newAccessToken,
-      refreshToken: newRefreshToken,
-      error: null
+      id: user._id,
+      fullname: user.fullname,
+      email: user.email,
+      userName: user.userName,
+      avatar: user.avatar,
+      role: user.role,
+      accountVerified: user.accountVerified,
+      createdAt: user.createdAt,
     };
-  }
-
-  async logout(refreshToken) {
-    if (!refreshToken) return;
-
-    const hashedToken = this.hashToken(refreshToken);
-    const user = await User.findOne({
-      $or: [
-        { 'sessions.refreshToken': hashedToken },
-        { refreshToken: hashedToken }
-      ]
-    }).select('+sessions +refreshToken');
-
-    if (!user) return;
-
-    if (user.sessions) {
-      user.sessions = user.sessions.filter(s => s.refreshToken !== hashedToken);
-    }
-
-    if (user.refreshToken === hashedToken) {
-      user.refreshToken = undefined;
-    }
-
-    await user.save({ validateBeforeSave: false });
-  }
-
-  async logoutAll(userId) {
-    if (!userId) return;
-    
-    const user = await User.findById(userId).select('+sessions +refreshToken');
-    if (!user) return;
-
-    user.sessions = [];
-    user.refreshToken = undefined;
-    await user.save({ validateBeforeSave: false });
-  }
-
-  // ================= PASSWORD MANAGEMENT =================
-  generateResetToken() {
-    const resetToken = crypto.randomBytes(20).toString('hex');
-    return {
-      plainToken: resetToken,
-      hashedToken: this.hashToken(resetToken),
-      expiresAt: Date.now() + SecurityConfig.RESET_PASSWORD_EXPIRY,
-    };
-  }
-
-  async changePassword(userId, currentPassword, newPassword) {
-    if (!userId) return { success: false, error: 'User ID required' };
-    
-    const user = await User.findById(userId).select('+password');
-    if (!user) return { success: false, error: 'User not found' };
-
-    const isMatch = await user.comparePassword(currentPassword);
-    if (!isMatch) return { success: false, error: 'Current password is incorrect' };
-
-    user.password = newPassword;
-    user.passwordChangedAt = new Date();
-    user.refreshToken = undefined;
-    user.sessions = [];
-    await user.save();
-
-    return { success: true, error: null };
-  }
-
-  async resetPassword(user, newPassword) {
-    if (!user) return;
-    
-    user.password = newPassword;
-    user.passwordChangedAt = new Date();
-    user.resetPasswordToken = undefined;
-    user.resetPasswordExpire = undefined;
-    user.refreshToken = undefined;
-    user.sessions = [];
-    await user.save();
-  }
-
-  // ================= GET SESSIONS =================
-  async getUserSessions(userId, currentRefreshToken) {
-    if (!userId) return [];
-    
-    const user = await User.findById(userId).select('+sessions');
-    if (!user || !user.sessions) return [];
-
-    const currentHashed = currentRefreshToken ? this.hashToken(currentRefreshToken) : null;
-    
-    return user.sessions
-      .filter(s => s.expiresAt > Date.now() && s.absoluteExpiresAt > Date.now())
-      .map(s => ({
-        deviceInfo: s.deviceInfo,
-        ipAddress: s.ipAddress,
-        lastUsed: s.lastUsed,
-        createdAt: s.createdAt,
-        expiresAt: s.expiresAt,
-        absoluteExpiresAt: s.absoluteExpiresAt,
-        daysRemaining: Math.ceil((s.absoluteExpiresAt - Date.now()) / (24 * 60 * 60 * 1000)),
-        isCurrent: currentHashed ? s.refreshToken === currentHashed : false
-      }));
-  }
-
-  // ================= HIGH-RISK ACTION VERIFICATION =================
-  // For Upwork-style: Verify password for sensitive actions
-  async verifyPassword(userId, password) {
-    const user = await User.findById(userId).select('+password');
-    if (!user) return false;
-    
-    return user.comparePassword(password);
-  }
-
-  // For Upwork-style: Require recent authentication
-  requireRecentAuth(accessToken) {
-    if (!this.isRecentAuth(accessToken)) {
-      throw new Error('reauthentication_required');
-    }
-    return true;
   }
 }
 
-export default new AuthService();
+// Export singleton instance
+export const authService = new AuthService();

@@ -365,24 +365,6 @@ export const isAuthenticated = (req, res, next) => {
 ## 📄 Root Files
 
 ### Root `README.md`
-```markdown
-# Full Stack Application with React + Vite + Express
-
-## 🚀 Quick Start
-
-### Prerequisites
-- Node.js (v18 or higher)
-- MongoDB Atlas account or local MongoDB
-- Cloudinary account (for file uploads)
-
-### Installation
-
-1. **Clone the repository**
-```bash
-git clone <your-repo-url>
-cd my-app
-```
-
 2. **Backend Setup**
 ```bash
 cd backend
@@ -432,23 +414,6 @@ CLOUDINARY_API_KEY=your_api_key
 CLOUDINARY_API_SECRET=your_api_secret
 ```
 
-## 📦 Dependencies
-
-### Backend
-- **express** - Web framework
-- **mongoose** - MongoDB ODM
-- **dotenv** - Environment variables
-- **cors** - CORS middleware
-- **cookie-parser** - Cookie parsing
-- **cloudinary** - Cloud storage
-- **multer** - File upload
-- **nodemon** - Development auto-restart
-
-### Frontend
-- **react** - UI library
-- **react-dom** - React rendering
-- **vite** - Build tool
-
 ## 🚦 Running the Application
 
 ### Development Mode
@@ -469,28 +434,6 @@ npm run build
 # Backend start
 cd backend
 npm start
-```
-
-## 📡 API Response Structure
-
-### Success Response
-```json
-{
-  "statusCode": 200,
-  "data": {},
-  "message": "Success",
-  "success": true
-}
-```
-
-### Error Response
-```json
-{
-  "statusCode": 404,
-  "message": "Resource not found",
-  "success": false,
-  "errors": []
-}
 ```
 
 ## 🔐 Features Included
@@ -514,54 +457,3 @@ npm start
 2. Create a User model
 3. Add Google OAuth routes
 4. Configure Google Cloud Console credentials
-
-## 📝 License
-
-MIT
-
-## 🤝 Contributing
-
-Pull requests are welcome. For major changes, please open an issue first.
-```
-
-## 🎯 Creating First Model Example
-
-### `backend/src/models/user.model.js`
-```javascript
-import mongoose, { Schema } from "mongoose";
-
-const userSchema = new Schema({
-    name: {
-        type: String,
-        required: true,
-        trim: true
-    },
-    email: {
-        type: String,
-        required: true,
-        unique: true,
-        lowercase: true,
-        trim: true
-    },
-    avatar: {
-        type: String,
-        default: ""
-    },
-    googleId: {
-        type: String,
-        unique: true,
-        sparse: true
-    }
-}, {
-    timestamps: true
-});
-
-export const User = mongoose.model("User", userSchema);
-```
-
-## 🏁 Final Steps
-
-1. Create `backend/public/temp/` directory (add `.gitkeep` to track in git)
-2. Update `.env` with your credentials
-3. Test backend: `npm run dev`
-4. Test frontend: `cd ../frontend && npm run dev`
