@@ -1,6 +1,5 @@
 # Complete Express + React + Vite Starter Template
-
-## 📁 Final Project Structure
+## Final Project Structure
 
 ```
 project-root/
@@ -32,7 +31,7 @@ project-root/
 └── README.md
 ```
 
-## 🚀 Initial Setup
+##  Initial Setup
 
 ### Backend Setup
 
@@ -60,16 +59,7 @@ mkdir controllers db middlewares models routes utils
 cd ..
 ```
 
-### Frontend Setup
-
-```bash
-# In root directory (my-app/)
-npm create vite@latest frontend -- --template react
-cd frontend
-npm install
-```
-
-## 📝 Backend Files
+## Backend Files
 
 ### 1. `backend/.env`
 ```env
@@ -362,7 +352,7 @@ export const isAuthenticated = (req, res, next) => {
 }
 ```
 
-## 📄 Root Files
+## Root Files
 
 ### Root `README.md`
 2. **Backend Setup**
@@ -380,28 +370,6 @@ cd frontend
 npm install
 npm run dev
 ```
-
-## 📁 Project Structure
-
-```
-├── backend/                # Express backend
-│   ├── src/
-│   │   ├── controllers/    # Route controllers
-│   │   ├── db/            # Database connection
-│   │   ├── middlewares/    # Custom middlewares
-│   │   ├── models/        # Mongoose models
-│   │   ├── routes/         # Express routes
-│   │   ├── utils/          # Utility functions
-│   │   └── app.js         # Express app setup
-│   ├── index.js            # Server entry point
-│   └── .env                # Environment variables
-├── frontend/               # React + Vite frontend
-│   ├── src/
-│   ├── public/
-│   └── vite.config.js
-└── README.md
-```
-
 ## 🔧 Environment Variables
 
 ### Backend (.env)
@@ -414,7 +382,7 @@ CLOUDINARY_API_KEY=your_api_key
 CLOUDINARY_API_SECRET=your_api_secret
 ```
 
-## 🚦 Running the Application
+##  Running the Application
 
 ### Development Mode
 ```bash
@@ -436,7 +404,7 @@ cd backend
 npm start
 ```
 
-## 🔐 Features Included
+## Features Included
 
 - ✅ MongoDB connection with Mongoose
 - ✅ Express server setup
@@ -451,7 +419,7 @@ npm start
 - ✅ Prettier code formatting
 - ✅ Google OAuth ready (optional)
 
-## 🛠️ Adding Google OAuth
+## Adding Google OAuth
 
 1. Uncomment Google OAuth code in `app.js` and `auth.middleware.js`
 2. Create a User model
